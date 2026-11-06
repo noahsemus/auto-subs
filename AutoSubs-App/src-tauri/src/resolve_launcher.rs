@@ -5,7 +5,9 @@
 //! routes that are gone), but it can write Fusion.prefs. The production
 //! launcher sets `Global.AutoSubsBridge.LaunchRequest` and calls SavePrefs
 //! (bootstrap.lua); a watcher outside Resolve sees the new value land on disk
-//! and opens the app. A running app is brought to the front instead, through
+//! and opens the app. Resolve 21.2 has no SavePrefs, so there the launcher
+//! writes the same value to `launch-request.txt` in the bridge mailbox
+//! (through fusion:OpenFile) and the watcher polls that file too. A running app is brought to the front instead, through
 //! LaunchServices on macOS and the single-instance plugin elsewhere.
 //!
 //! The watcher is this binary started with `--resolve-watcher`. main.rs runs it
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::resolve_bridge::{fusion_prefs_path, pref_value};
+use crate::resolve_bridge::{fusion_prefs_path, mailbox_dir, pref_value};
 
 pub const WATCHER_FLAG: &str = "--resolve-watcher";
 /// Run by the Windows installer before its "AutoSubs is running" check, which
@@ -32,6 +34,8 @@ pub const WATCHER_FLAG: &str = "--resolve-watcher";
 pub const STOP_FLAG: &str = "--stop-resolve-watcher";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Resolve 21.2's launch request, in the bridge mailbox (see bootstrap.lua).
+const LAUNCH_REQUEST_FILE: &str = "launch-request.txt";
 /// Fusion.prefs keeps the last request across Resolve sessions, and another
 /// profile's file can become the newest. Only a value written moments ago is a
 /// click.
@@ -156,7 +160,9 @@ fn run_watcher() -> ! {
     let exe_stamp = exe.as_deref().and_then(modified);
 
     let mut seen_mtime = None;
+    let mut seen_file_mtime = None;
     let mut last_request = String::new();
+    let launch_file = mailbox_dir().ok().map(|d| d.join(LAUNCH_REQUEST_FILE));
     loop {
         // An update replaced (or an uninstall removed) our binary: exit so the
         // restarted app can start the new one.
@@ -175,17 +181,35 @@ fn run_watcher() -> ! {
                     seen_mtime = mtime;
                     let text = String::from_utf8_lossy(&bytes);
                     if let Some(request) = pref_value(&text, "LaunchRequest") {
-                        if request != last_request {
-                            last_request = request.to_string();
-                            if is_fresh(request, unix_secs()) {
-                                open_app();
-                            }
-                        }
+                        handle_request(request, &mut last_request);
                     }
                 }
             }
         }
+
+        // Resolve 21.2's channel: the request in its own file.
+        if let Some(file) = launch_file.as_deref() {
+            let mtime = modified(file);
+            if mtime.is_some() && mtime != seen_file_mtime {
+                if let Ok(bytes) = fs::read(file) {
+                    seen_file_mtime = mtime;
+                    let text = String::from_utf8_lossy(&bytes);
+                    handle_request(text.trim(), &mut last_request);
+                }
+            }
+        }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Opens the app for a request not seen before, if it was written moments ago.
+fn handle_request(request: &str, last_request: &mut String) {
+    if request.is_empty() || request == last_request {
+        return;
+    }
+    *last_request = request.to_string();
+    if is_fresh(request, unix_secs()) {
+        open_app();
     }
 }
 

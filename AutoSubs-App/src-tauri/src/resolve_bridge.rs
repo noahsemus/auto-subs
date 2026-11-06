@@ -9,10 +9,18 @@
 //!
 //! * Rust -> Lua: we atomically write `request.lua` (a `return {...}` chunk
 //!   carrying an id and a JSON body) into a shared mailbox directory. The Lua
-//!   loop picks it up with `loadfile`.
-//! * Lua -> Rust: the Lua side calls `fusion:SetPrefs` + `SavePrefs()`, which
-//!   writes `Fusion.prefs` to disk immediately. We poll that file for an
-//!   `Ack = "<id>"` (request picked up) and `Response = "<id>:<base64 json>"`.
+//!   loop picks it up with `loadfile`, or on Resolve 21.2 (no `loadfile`) by
+//!   reading it line by line through `fusion:OpenFile`, so the body is split
+//!   across short lines (see `encode_request`).
+//! * Lua -> Rust, Resolve <= 21.1: the Lua side calls `fusion:SetPrefs` +
+//!   `SavePrefs()`, which writes `Fusion.prefs` to disk immediately. We poll
+//!   that file for an `Ack = "<id>"` (request picked up) and
+//!   `Response = "<id>:<base64 json>"`.
+//! * Lua -> Rust, Resolve 21.2+ (no `SavePrefs`): the same two values go in
+//!   `ack.txt` and `response.txt` in the mailbox, written through
+//!   `fusion:OpenFile`. Those writes aren't atomic, so a read only counts
+//!   when the ack equals our id or the response decodes to valid JSON.
+//!   Both channels are polled, so the app works with either Lua side.
 //!
 //! The mailbox directory is `<data_local_dir>/com.autosubs/resolve-bridge`
 //! (LOCALAPPDATA on Windows, ~/Library/Application Support on macOS,
@@ -142,20 +150,65 @@ pub(crate) fn fusion_prefs_path() -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// Build the request chunk: `return { id = "<id>", body = [==[<json>]==] }`
+/// Target length of one body piece in the request chunk. Resolve 21.2's Lua
+/// side reads the file with FileIO:ReadLine, so no line should be long.
+const REQUEST_CHUNK_LEN: usize = 1024;
+
+/// Split `body` into pieces of about `REQUEST_CHUNK_LEN` bytes, each safe to
+/// wrap in a long bracket: a piece never ends in `]` or `=` (it could merge
+/// with the closing bracket into an earlier close) and never starts with a
+/// newline (Lua drops a newline right after the opening bracket). Splits land
+/// on char boundaries so every piece is valid UTF-8.
+fn split_request_body(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while start < body.len() {
+        let mut end = (start + REQUEST_CHUNK_LEN).min(body.len());
+        while end < body.len()
+            && (!body.is_char_boundary(end)
+                || matches!(bytes[end - 1], b']' | b'=')
+                || matches!(bytes[end], b'\n' | b'\r'))
+        {
+            end += 1;
+        }
+        pieces.push(&body[start..end]);
+        start = end;
+    }
+    pieces
+}
+
+/// Build the request chunk:
+///
+/// ```text
+/// return { id = "<id>", body = table.concat({
+/// [==[<piece>]==],
+/// ...
+/// }) }
+/// ```
+///
 /// where the long-bracket level is the smallest `n` such that `]` + `=`*n +
-/// `]` does not appear in the body.
+/// `]` does not appear in the body, nor form across the body's end and the
+/// closing bracket (a body ending in `]=` at level 1). Splitting over short lines keeps
+/// the file readable by FileIO:ReadLine (Resolve 21.2) while staying a plain
+/// Lua chunk for `loadfile` (older Resolve and older Lua loops).
 fn encode_request(id: &str, body: &str) -> String {
     let mut level = 1usize;
     loop {
         let closing = format!("]{}]", "=".repeat(level));
-        if !body.contains(&closing) {
+        let closed = format!("{}{}", body, closing);
+        if closed.find(&closing) == Some(body.len()) {
             break;
         }
         level += 1;
     }
     let eq = "=".repeat(level);
-    format!("return {{ id = \"{}\", body = [{}[{}]{}] }}", id, eq, body, eq)
+    let mut out = format!("return {{ id = \"{}\", body = table.concat({{\n", id);
+    for piece in split_request_body(body) {
+        out.push_str(&format!("[{}[{}]{}],\n", eq, piece, eq));
+    }
+    out.push_str("}) }\n");
+    out
 }
 
 /// Extract the value of `key = "..."` assignments from the prefs file text.
@@ -299,7 +352,12 @@ fn decode_response<'a>(value: &'a str, id: &str) -> Option<Result<String, String
 /// pick our request up when it finishes. A very old acked-but-unanswered id
 /// is an abandoned leftover, not evidence of life.
 fn request_in_flight(text: &str, id: &str) -> bool {
-    let Some(ack) = pref_value(text, "Ack") else {
+    in_flight(pref_value(text, "Ack"), pref_value(text, "Response"), id)
+}
+
+/// `request_in_flight` over an ack / response pair from either channel.
+fn in_flight(ack: Option<&str>, response: Option<&str>, id: &str) -> bool {
+    let Some(ack) = ack else {
         return false;
     };
     if ack == id {
@@ -311,10 +369,18 @@ fn request_in_flight(text: &str, id: &str) -> bool {
     if unix_millis().saturating_sub(encoded / 1000) > BUSY_ACK_MAX_AGE_MS {
         return false;
     }
-    match pref_value(text, "Response") {
+    match response {
         Some(value) => decode_response(value, ack).is_none(),
         None => true,
     }
+}
+
+/// Contents of a mailbox reply file (Resolve 21.2's channel), trimmed of the
+/// newline FileIO:WriteLine adds. None when the file is missing or empty.
+fn read_reply_file(path: &std::path::Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// If the payload carries a string `filePath`, read that file and attach the
@@ -385,13 +451,22 @@ pub async fn send_resolve_payload(
 /// Lua script can't replay it. Called once at app startup.
 pub fn clear_stale_request() {
     if let Ok(dir) = mailbox_dir() {
+        // Resolve 21.2's Lua side can write files but can't create folders,
+        // and the production launcher writes launch-request.txt here before
+        // any request has been sent, so make sure the folder exists.
+        let _ = fs::create_dir_all(&dir);
         let _ = fs::remove_file(dir.join("request.lua"));
         let _ = fs::remove_file(dir.join("request.lua.tmp"));
     }
 }
 
 async fn wait_for_response(id: &str, timeout: Duration) -> Result<String, String> {
-    let prefs_path = fusion_prefs_path().ok_or_else(|| RESOLVE_OFFLINE_MESSAGE.to_string())?;
+    // Either channel may be the live one: Fusion.prefs (Resolve <= 21.1) or
+    // the mailbox reply files (21.2+, which has no SavePrefs).
+    let prefs_path = fusion_prefs_path();
+    let dir = mailbox_dir()?;
+    let ack_path = dir.join("ack.txt");
+    let response_path = dir.join("response.txt");
 
     let deadline = Instant::now() + timeout;
     let busy_cap = Instant::now() + MAX_BUSY_WAIT;
@@ -399,11 +474,28 @@ async fn wait_for_response(id: &str, timeout: Duration) -> Result<String, String
     let mut acked = false;
 
     loop {
+        // Mailbox reply files first: on 21.2 they are the only channel.
+        let file_ack = read_reply_file(&ack_path);
+        let file_response = read_reply_file(&response_path);
+        if let Some(value) = file_response.as_deref() {
+            if let Some(result) = decode_response(value, id) {
+                return result;
+            }
+        }
+        if !acked {
+            if file_ack.as_deref() == Some(id) {
+                acked = true;
+            }
+            if in_flight(file_ack.as_deref(), file_response.as_deref(), id) {
+                ack_deadline = (Instant::now() + BUSY_HOLD).min(busy_cap);
+            }
+        }
+
         // Read bytes, not a UTF-8 string: Resolve writes prefs in the user's
         // ANSI code page on Windows, so a non-ASCII profile path makes the
         // file invalid UTF-8 and a strict read would report a healthy bridge
         // as offline forever. Every key and value we parse is ASCII.
-        if let Ok(bytes) = fs::read(&prefs_path) {
+        if let Some(bytes) = prefs_path.as_ref().and_then(|p| fs::read(p).ok()) {
             let text = String::from_utf8_lossy(&bytes);
             if let Some(value) = pref_value(&text, "Response") {
                 if let Some(result) = decode_response(value, id) {
@@ -483,7 +575,10 @@ mod tests {
         // Simple body: level 1 ([=[ ... ]=]) suffices; note "]]" inside the
         // body must not close the string.
         let out = encode_request("42", "{\"a\":1}");
-        assert_eq!(out, "return { id = \"42\", body = [=[{\"a\":1}]=] }");
+        assert_eq!(
+            out,
+            "return { id = \"42\", body = table.concat({\n[=[{\"a\":1}]=],\n}) }\n"
+        );
 
         // Body containing "]]" is still fine at level 1 (only "]=]" closes).
         let out = encode_request("1", "x]]y");
@@ -496,6 +591,33 @@ mod tests {
         // Body containing "]=]" and "]==]" forces level 3.
         let out = encode_request("3", "a]=]b]==]c");
         assert!(out.contains("[===[a]=]b]==]c]===]"));
+
+        // A body ending in "]=" would close a level-1 string early.
+        let out = encode_request("5", "a]=");
+        assert!(out.contains("[==[a]=]==]"));
+
+        // An empty body is an empty concat.
+        let out = encode_request("4", "");
+        assert_eq!(out, "return { id = \"4\", body = table.concat({\n}) }\n");
+    }
+
+    #[test]
+    fn split_request_body_keeps_lines_short_and_safe() {
+        let body = format!("{}]]]===={}\u{e9}{}", "a".repeat(1022), "\n".repeat(3), "b".repeat(5000));
+        let pieces = split_request_body(&body);
+        assert_eq!(pieces.concat(), body);
+        assert!(pieces.len() > 4);
+        for (i, piece) in pieces.iter().enumerate() {
+            assert!(piece.len() < REQUEST_CHUNK_LEN + 16, "piece {} too long", i);
+            if i + 1 < pieces.len() {
+                assert!(!piece.ends_with(']') && !piece.ends_with('='), "piece {} ends unsafely", i);
+            }
+            if i > 0 {
+                assert!(!piece.starts_with('\n') && !piece.starts_with('\r'), "piece {} starts with newline", i);
+            }
+        }
+        // The first piece can't start with a newline either, but the body
+        // never does: serde_json escapes newlines inside strings.
     }
 
     #[test]

@@ -4,9 +4,11 @@
 --
 -- Resolve 21.1 sandboxes the Lua state that runs Workspace > Scripts scripts:
 -- io, ffi, package, require, os.execute and bmd.readdir are all nil here.
+-- Resolve 21.2 also removed loadfile and fusion:SavePrefs.
 -- Modules are loaded via AutoSubs_require (see bootstrap.lua) and the bridge
--- to the desktop app is a file mailbox (request.lua read via loadfile;
--- responses written to Fusion.prefs via SetPrefs/SavePrefs).
+-- to the desktop app is a file mailbox: request.lua read via loadfile, or
+-- fusion:OpenFile on 21.2; responses written to Fusion.prefs via
+-- SetPrefs/SavePrefs, or on 21.2 to ack.txt / response.txt in the mailbox.
 
 -- Shared access to the Resolve / Fusion scripting environment (see resolve_env.lua).
 local resolve_env = AutoSubs_require("resolve_env")
@@ -44,6 +46,17 @@ local resources_path
 local main_app
 -- Full path to the mailbox request file the desktop app writes (set in Init).
 local REQUEST_FILE
+-- Reply files for the 21.2 file channel (set in Init; see bridge_write).
+local ACK_FILE
+local RESPONSE_FILE
+
+-- loadfile, or bootstrap's OpenFile-based replacement where loadfile is gone
+-- (Resolve 21.2). A bootstrap older than the replacement only runs where
+-- loadfile exists.
+local function load_chunk(path)
+    local loader = rawget(_G, "AutoSubs_loadfile") or rawget(_G, "loadfile")
+    return loader(path)
+end
 
 -- Load Resolve objects
 local projectManager = resolve:GetProjectManager()
@@ -2816,11 +2829,22 @@ local handlers = {
     end,
 }
 
--- Write an ack / response for a request into Fusion.prefs. Rust polls the
--- prefs file on disk; SetPrefs + SavePrefs is the only channel back that the
--- sandboxed scripting state still allows.
-local function bridge_write(key, value)
+-- Write an ack / response for a request. Rust polls both channels:
+--   * Resolve <= 21.1: Fusion.prefs on disk, via SetPrefs + SavePrefs.
+--   * Resolve 21.2+ (no SavePrefs): a file in the mailbox, written through
+--     fusion:OpenFile. The write isn't atomic; Rust only accepts an ack that
+--     equals its request id and a response that decodes to valid JSON.
+local function bridge_write(key, value, file)
     if not fusion then
+        return
+    end
+    if rawget(_G, "AUTOSUBS_FILE_CHANNEL") and file then
+        for _ = 1, 5 do
+            if AutoSubs_writefile(file, value) then
+                return
+            end
+            bmd.wait(0.05)
+        end
         return
     end
     -- Retry a few times: SavePrefs can transiently fail while Resolve is
@@ -2838,7 +2862,7 @@ local function bridge_write(key, value)
 end
 
 local function bridge_ack(id)
-    bridge_write("Global.AutoSubsBridge.Ack", id)
+    bridge_write("Global.AutoSubsBridge.Ack", id, ACK_FILE)
 end
 
 local function bridge_respond(id, body_json)
@@ -2851,7 +2875,7 @@ local function bridge_respond(id, body_json)
     local safe = body_json:gsub("[\128-\255]", function(c)
         return string.format("\\u%04x", 0xE000 + c:byte())
     end)
-    bridge_write("Global.AutoSubsBridge.Response", id .. ":" .. AutoSubs_base64(safe))
+    bridge_write("Global.AutoSubsBridge.Response", id .. ":" .. AutoSubs_base64(safe), RESPONSE_FILE)
 end
 
 -- Claim a mailbox request so only one loop handles it. A raced takeover or
@@ -2878,7 +2902,7 @@ end
 function StartServer()
     -- File-mailbox loop: the desktop app drops request.lua in the shared
     -- mailbox directory; we ack it, run the handler, and write the response
-    -- into Fusion.prefs (see resolve_bridge.rs for the other side).
+    -- back through bridge_write (see resolve_bridge.rs for the other side).
     local quitServer = false
     local shouldReload = false
     -- Last handled request id lives in the AUTOSUBS_LAST_REQUEST_ID global
@@ -2947,7 +2971,7 @@ function StartServer()
 
         if bmd.fileexists(REQUEST_FILE) then
             -- nil on a half-written/garbage file: just retry next tick
-            local chunk = loadfile(REQUEST_FILE)
+            local chunk = load_chunk(REQUEST_FILE)
             local ok, req = false, nil
             if chunk then
                 ok, req = pcall(chunk)
@@ -3081,7 +3105,7 @@ function StartServer()
             AutoSubs_loaded[name] = nil
         end
 
-        local new_core_chunk, load_err = loadfile(new_core_path)
+        local new_core_chunk, load_err = load_chunk(new_core_path)
         if not new_core_chunk then
             print("[AutoSubs Server] Failed to load new autosubs_core.lua:", load_err)
             print("[AutoSubs Server] Restarting previous server...")
@@ -3118,6 +3142,8 @@ local AutoSubs = {
         main_app = executable_path
         resources_path = resources_folder
         REQUEST_FILE = join_path(AUTOSUBS_MAILBOX, "request.lua")
+        ACK_FILE = join_path(AUTOSUBS_MAILBOX, "ack.txt")
+        RESPONSE_FILE = join_path(AUTOSUBS_MAILBOX, "response.txt")
 
         json = AutoSubs_require("dkjson")
         timecode = AutoSubs_require("timecode")

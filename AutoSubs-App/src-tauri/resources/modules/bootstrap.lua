@@ -1,15 +1,21 @@
 -- AutoSubs bootstrap: runs inside Resolve's sandboxed Lua state.
 --
 -- Resolve 21.1 (free edition) removed io, ffi, package, require, os.execute
--- and bmd.readdir from the state that runs Workspace > Scripts scripts. This
--- file therefore provides everything the modules need without those globals:
+-- and bmd.readdir from the state that runs Workspace > Scripts scripts, and
+-- 21.2 also removed loadfile, dofile and fusion:SavePrefs. What still works
+-- there is fusion:OpenFile, which returns a FileIO handle: mode 1 reads
+-- (ReadLine), mode 2 truncates and writes (WriteLine). This file therefore
+-- provides everything the modules need without those globals:
 --   * platform detection (no ffi)
---   * a `require` replacement (AutoSubs_require) built on loadfile
---   * a base64 encoder for the Fusion.prefs response channel
+--   * file helpers (AutoSubs_loadfile / AutoSubs_writefile) that use loadfile
+--     and SavePrefs where they exist and fusion:OpenFile where they don't
+--   * a `require` replacement (AutoSubs_require) built on AutoSubs_loadfile
+--   * a base64 encoder for the response channel
 --   * the mailbox path the file-bridge shares with the desktop app
+--   * on 21.2, a print that reaches the Console (see console_print)
 --
--- The chunk returns the boot function; entry scripts run it as:
---   local boot = assert(loadfile(bootstrap_path))()
+-- The chunk returns the boot function; entry scripts load it with loadfile,
+-- or on 21.2 with the same OpenFile reader inlined in the launcher, and run:
 --   boot(resources_folder, app_executable, dev_mode)
 --
 ---@diagnostic disable: undefined-global
@@ -62,6 +68,96 @@ local function base64_encode(data)
         end
         return B64_CHARS:sub(c + 1, c + 1)
     end) .. ({ "", "==", "=" })[#data % 3 + 1])
+end
+
+-- File access that survives every sandbox generation. loadfile is used where
+-- it exists (Resolve <= 21.1, and it's faster); otherwise fusion:OpenFile.
+local function open_fusion_file(path, mode)
+    local fu = rawget(_G, "fusion") or rawget(_G, "fu")
+    if not fu then
+        return nil
+    end
+    local ok, h = pcall(function() return fu:OpenFile(path, mode) end)
+    if ok then
+        return h
+    end
+    return nil
+end
+
+-- Whole file as a string, or nil. ReadLine keeps each line's "\n", so the
+-- pieces concatenate back to the original bytes; a line longer than its
+-- internal buffer comes back in several pieces, which concatenate the same way.
+local function read_text_file(path)
+    local h = open_fusion_file(path, 1)
+    if not h then
+        return nil
+    end
+    local parts = {}
+    local ok = pcall(function()
+        while true do
+            local line = h:ReadLine()
+            if line == nil or line == "" then
+                break
+            end
+            parts[#parts + 1] = line
+        end
+    end)
+    pcall(function() h:Close() end)
+    if not ok then
+        return nil
+    end
+    return table.concat(parts)
+end
+
+local function load_lua_file(path)
+    local native = rawget(_G, "loadfile")
+    if native then
+        return native(path)
+    end
+    local text = read_text_file(path)
+    if text == nil then
+        return nil, "could not read " .. path
+    end
+    return loadstring(text, "@" .. path)
+end
+
+-- Replace a file's contents with text (plus the trailing newline WriteLine
+-- adds; readers trim it). Not atomic: readers must validate what they read.
+local function write_text_file(path, text)
+    local h = open_fusion_file(path, 2)
+    if not h then
+        return false
+    end
+    local ok = pcall(function() h:WriteLine(text) end)
+    pcall(function() h:Close() end)
+    return ok
+end
+
+-- True when Lua -> app replies must go through files: SavePrefs is gone
+-- (Resolve 21.2+) but fusion:OpenFile can write.
+local function file_channel(fu)
+    if not fu then
+        return false
+    end
+    local ok, save = pcall(function() return fu.SavePrefs end)
+    if ok and save ~= nil then
+        return false
+    end
+    local ok2, open = pcall(function() return fu.OpenFile end)
+    return ok2 and open ~= nil
+end
+
+-- On 21.2 a menu script's print never reaches the Console; only code run
+-- through fusion:Execute prints there. Echo each line through Execute.
+local function console_print(fu)
+    return function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do
+            parts[#parts + 1] = tostring((select(i, ...)))
+        end
+        local line = table.concat(parts, "\t"):gsub("%]=*%]", "] ]")
+        pcall(fu.Execute, fu, "print([==[" .. line .. "]==])")
+    end
 end
 
 -- Resident-bridge handshake. The Utility/Dev scripts launch the bridge, and a
@@ -149,17 +245,30 @@ local function boot(resources_folder, app_executable, dev_mode, opts)
     local mode = (opts and opts.mode) or "manual"
     local fu = fusion_object()
     local can_signal = fu and type(fu.SetPrefs) == "function"
+    local use_files = file_channel(fu)
+    _G.AUTOSUBS_FILE_CHANNEL = use_files
+    _G.AutoSubs_loadfile = load_lua_file
+    _G.AutoSubs_writefile = write_text_file
+    if fu and rawget(_G, "loadfile") == nil then
+        _G.print = console_print(fu)
+    end
     if can_signal and opts and opts.open_app then
         -- Open from Resolve: this state can't launch programs, so ask the
         -- app's login-item watcher (resolve_launcher.rs) to do it. The
         -- watcher reads Fusion.prefs from disk, so this is the one SavePrefs
-        -- a launch makes. It happens on the user's click, never from the idle
-        -- loop. Done first so the app opens while the takeover below waits.
-        pcall(function()
-            fu:SetPrefs("Global.AutoSubsBridge.LaunchRequest",
-                tostring(os.time()) .. " " .. tostring({}))
-            fu:SavePrefs()
-        end)
+        -- a launch makes; on 21.2, which has no SavePrefs, the request goes
+        -- in launch-request.txt in the mailbox instead. It happens on the
+        -- user's click, never from the idle loop. Done first so the app opens
+        -- while the takeover below waits.
+        local request = tostring(os.time()) .. " " .. tostring({})
+        if use_files then
+            write_text_file(_G.AUTOSUBS_MAILBOX .. _G.AUTOSUBS_SEP .. "launch-request.txt", request)
+        else
+            pcall(function()
+                fu:SetPrefs("Global.AutoSubsBridge.LaunchRequest", request)
+                fu:SavePrefs()
+            end)
+        end
     end
     if mode == "manual" and can_signal then
         -- Takeover: ask any running loop to exit, then start fresh. Stop is
@@ -197,7 +306,7 @@ local function boot(resources_folder, app_executable, dev_mode, opts)
             return loaded[name]
         end
         local path = modules_path .. _G.AUTOSUBS_SEP .. name .. ".lua"
-        local chunk, load_err = loadfile(path)
+        local chunk, load_err = load_lua_file(path)
         if not chunk then
             error("AutoSubs module '" .. name .. "' not found at: " .. path
                 .. (load_err and (" (" .. tostring(load_err) .. ")") or ""), 2)

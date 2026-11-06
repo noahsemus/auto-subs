@@ -4,7 +4,7 @@
 --
 -- Resolve 21.1 sandboxes this scripting state: io, ffi, package, require and
 -- os.execute are all unavailable. Everything the modules need is provided by
--- bootstrap.lua, which we run via loadfile.
+-- bootstrap.lua, which we load below (load_lua_file).
 --
 -- This file is a TEMPLATE. The AutoSubs app itself writes the installed copy
 -- into the user's Resolve Scripts folder on startup (resolve_scripts.rs),
@@ -44,6 +44,30 @@ end
 -- open_app: ask the app's "Open from Resolve" watcher to open AutoSubs. Only
 -- this production launcher sets it, so the Dev script never opens the
 -- installed app.
-local boot = assert(loadfile(bootstrap_path))()
+-- Resolve 21.2 also removed loadfile from this state, but fusion:OpenFile
+-- (mode 1 = read) still reads files, so the bootstrap is read line by line
+-- and compiled with loadstring. Older Resolve versions keep loadfile.
+local function load_lua_file(path)
+    local native = rawget(_G, "loadfile")
+    if native then
+        return native(path)
+    end
+    local fu = rawget(_G, "fusion") or rawget(_G, "fu")
+    local ok, h = pcall(function() return fu:OpenFile(path, 1) end)
+    if not ok or not h then
+        return nil, "could not open " .. path
+    end
+    local parts = {}
+    while true do
+        local line = h:ReadLine()
+        if line == nil or line == "" then
+            break
+        end
+        parts[#parts + 1] = line
+    end
+    h:Close()
+    return loadstring(table.concat(parts), "@" .. path)
+end
+local boot = assert(load_lua_file(bootstrap_path))()
 boot(resources_folder, app_executable, false,
     { mode = "manual", mailbox_dir = __AUTOSUBS_MAILBOX_DIR__, open_app = true })

@@ -30,13 +30,38 @@ if resources_folder == "__AUTOSUBS_RESOURCES_FOLDER__" then
     )
 end
 
--- Load the bootstrap via loadfile (the sandboxed scripting state has no
--- require/package); it sets up module loading and starts the core server.
+-- Load the bootstrap (the sandboxed scripting state has no require/package,
+-- and on Resolve 21.2 no loadfile); it sets up module loading and starts the
+-- core server.
 -- mode = "manual": running this script restarts the bridge against your repo
 -- checkout (it stops any running bridge first, including one a 3.10.0 startup
 -- scriptlib left behind).
 local bootstrap_path = resources_folder .. "/modules/bootstrap.lua"
-local boot = assert(loadfile(bootstrap_path))()
+-- Resolve 21.2 also removed loadfile from this state, but fusion:OpenFile
+-- (mode 1 = read) still reads files, so the bootstrap is read line by line
+-- and compiled with loadstring. Older Resolve versions keep loadfile.
+local function load_lua_file(path)
+    local native = rawget(_G, "loadfile")
+    if native then
+        return native(path)
+    end
+    local fu = rawget(_G, "fusion") or rawget(_G, "fu")
+    local ok, h = pcall(function() return fu:OpenFile(path, 1) end)
+    if not ok or not h then
+        return nil, "could not open " .. path
+    end
+    local parts = {}
+    while true do
+        local line = h:ReadLine()
+        if line == nil or line == "" then
+            break
+        end
+        parts[#parts + 1] = line
+    end
+    h:Close()
+    return loadstring(table.concat(parts), "@" .. path)
+end
+local boot = assert(load_lua_file(bootstrap_path))()
 
 -- No executable path is needed in dev mode: the core server never launches the
 -- desktop app while dev mode is enabled.
